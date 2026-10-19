@@ -1,0 +1,197 @@
+name: Windows RDP Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: 'Windows OS Version'
+        required: false
+        default: 'windows-2022'
+      ram_size:
+        description: 'RAM Configuration'
+        required: false
+        default: '16GB'
+      ngrok_token:
+        description: 'Ngrok Auth Token'
+        required: false
+        default: ''
+      ngrok_region:
+        description: 'Ngrok Region'
+        required: false
+        default: 'eu'
+
+jobs:
+  rdp-setup:
+    runs-on: ${{ inputs.windows_version != '' && inputs.windows_version || 'windows-2022' }}
+    timeout-minutes: 360 # GitHub Free max runtime is 6 hours
+    steps:
+      - name: Download and extract Ngrok v3
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath .
+          Remove-Item ngrok.zip
+          Copy-Item .\\ngrok.exe C:\\Windows\\System32\\ngrok.exe -Force
+
+      - name: Optimize Disk and Configure RAM
+        shell: pwsh
+        run: |
+          $ramChoice = "${{ inputs.ram_size }}"
+          Write-Output "[*] Target RAM Configuration: $ramChoice"
+          
+          if ($ramChoice -eq "32GB" -or $ramChoice -eq "64GB") {
+            $pageMB = if ($ramChoice -eq "64GB") { 57344 } else { 24576 }
+            try {
+              Set-CimInstance -Query "Select * from Win32_ComputerSystem" -Property @{AutomaticManagedPagefile = $false} -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management' -Name 'PagingFiles' -Value @("C:\\pagefile.sys $pageMB $pageMB") -ErrorAction SilentlyContinue
+              Write-Output "[+] Virtual memory pagefile configured for $pageMB MB"
+            } catch {}
+          }
+          
+          # Clean caches to maximize SSD free space
+          Remove-Item -Recurse -Force "C:\\hostedtoolcache" -ErrorAction SilentlyContinue
+          
+          $freeGB = [Math]::Round((Get-PSDrive C).Free / 1GB, 1)
+          Write-Output "[+] Free SSD Space on C:: $freeGB GB"
+
+      - name: Enable RDP and Firewall
+        shell: pwsh
+        run: |
+          # Configure Remote Desktop in Registry
+          Set-ItemProperty -Path "HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" -Name "PortNumber" -Value 3389 -Force
+          
+          # Configure and Restart TermService to apply fDenyTSConnections = 0 (critical for Windows Server 2022)
+          Set-Service -Name "TermService" -StartupType Automatic
+          Restart-Service -Name "TermService" -Force
+          
+          # Disable firewall completely for maximum reliability
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue
+
+          # Verify port 3389 is actively listening on localhost
+          $ready = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            $test = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              Write-Output "[+] TermService is listening on 127.0.0.1:3389!"
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) {
+            Write-Output "[!] Warning: Retrying TermService restart..."
+            Restart-Service -Name "TermService" -Force
+            Start-Sleep -Seconds 2
+          }
+
+      - name: Create Admin User
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\\secpol.cfg
+          (Get-Content C:\\secpol.cfg).replace("PasswordComplexity = 1", "PasswordComplexity = 0").replace("MinimumPasswordLength = 8", "MinimumPasswordLength = 0") | Set-Content C:\\secpol.cfg
+          secedit /configure /db C:\\windows\\security\\local.sdb /cfg C:\\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item -Force C:\\secpol.cfg -ErrorAction SilentlyContinue
+
+          cmd.exe /c "net user Fazah Fazah@123 /add /expires:never /active:yes"
+          cmd.exe /c "net localgroup Administrators Fazah /add"
+          cmd.exe /c "net localgroup `"Remote Desktop Users`" Fazah /add"
+          cmd.exe /c "net user runneradmin Fazah@123 /active:yes"
+
+      - name: Configure and Start Ngrok Tunnel
+        id: ngrok-tunnel
+        shell: pwsh
+        env:
+          DEFAULT_NGROK: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          $tok = "${{ inputs.ngrok_token }}"
+          if (-not $tok) { $tok = $env:DEFAULT_NGROK }
+          $reg = "${{ inputs.ngrok_region }}"
+          if (-not $reg -or $reg -eq "gb") { $reg = "eu" }
+
+          # Write ngrok config with explicit IPv4 localhost binding and region
+          @(
+            'version: "2"',
+            "authtoken: $tok",
+            "region: $reg",
+            'tunnels:',
+            '  rdp:',
+            '    proto: tcp',
+            '    addr: 127.0.0.1:3389'
+          ) | Out-File -FilePath "C:\\ngrok.yml" -Encoding ascii
+
+          # Install and start Ngrok as native Windows Service so it survives across all steps
+          Write-Output "[*] Installing Ngrok Windows Service..."
+          C:\\Windows\\System32\\ngrok.exe service install --config="C:\\ngrok.yml"
+          C:\\Windows\\System32\\ngrok.exe service start
+
+          # Wait for tunnel to become available via local API (up to 40s)
+          $tunnelUrl = $null
+          $timeout = 20
+          while ($timeout -gt 0 -and -not $tunnelUrl) {
+            Start-Sleep -Seconds 2
+            try {
+              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              $tcp = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+              if ($tcp) {
+                $tunnelUrl = $tcp.public_url -replace "^tcp://", ""
+              }
+            } catch {}
+            $timeout--
+          }
+
+          if (-not $tunnelUrl) {
+            Write-Output "::error::Ngrok tunnel could not be established"
+            exit 1
+          }
+
+          Write-Output "TUNNEL_HOST=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
+          Write-Output "[+] Tunnel established successfully: $tunnelUrl"
+
+      - name: Build and Upload .rdp Artifact
+        shell: pwsh
+        run: |
+          @(
+            "full address:s:${{ env.TUNNEL_HOST }}",
+            "username:s:Fazah",
+            "prompt for credentials:i:1",
+            "authentication level:i:2",
+            "screen mode id:i:2",
+            "desktopwidth:i:1920",
+            "desktopheight:i:1080",
+            "redirectclipboard:i:1"
+          ) | Out-File -FilePath rdp-connection.rdp -Encoding ascii
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection
+          path: rdp-connection.rdp
+          retention-days: 1
+
+      - name: Keep Alive Session
+        shell: pwsh
+        env:
+          TUNNEL_HOST: ${{ steps.ngrok-tunnel.outputs.tunnel_url }}
+        run: |
+          Write-Output "[+] RDP is now live ($env:TUNNEL_HOST)! Keeping runner alive..."
+          while ($true) {
+            $svc = Get-Service -Name "ngrok" -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Running") {
+              Write-Output "[!] Ngrok service stopped. Restarting service..."
+              Start-Service -Name "ngrok" -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds 120
+          }
+
+      - name: Cleanup Ngrok
+        if: always()
+        shell: pwsh
+        run: |
+          C:\\Windows\\System32\\ngrok.exe service stop -ErrorAction SilentlyContinue
+          C:\\Windows\\System32\\ngrok.exe service uninstall -ErrorAction SilentlyContinue
